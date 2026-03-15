@@ -1,6 +1,13 @@
 from datetime import datetime, timedelta
 from typing import Optional
 
+# bcrypt >= 4.1 移除了 __about__ 属性，passlib 尚未适配，需要打补丁
+import bcrypt as _bcrypt
+if not hasattr(_bcrypt, '__about__'):
+    class _About:
+        __version__ = getattr(_bcrypt, '__version__', '4.0.0')
+    _bcrypt.__about__ = _About()
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt

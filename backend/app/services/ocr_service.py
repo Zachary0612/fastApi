@@ -20,6 +20,9 @@ NAME_SUFFIXES = ["片", "胶囊", "颗粒", "口服液", "滴眼液", "注射液
 NAME_FORBIDDEN = ["国药准字", "请仔细", "OTC", "有限公司", "使用", "指导", "福建", "用于"]
 ENGLISH_SUFFIXES = ["TABLET", "TABLETS", "CAPSULE", "CAPSULES", "GRANULES", "SYRUP", "IBUPROFEN"]
 CHINESE_REGEX = re.compile(r"[\u4e00-\u9fff]")
+ENGLISH_GENERIC_MAP = {
+    "IBUPROFEN": "布洛芬",
+}
 
 
 def check_ocr_models() -> list:
@@ -87,6 +90,35 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
     return binary
 
 
+def enhance_for_ocr(img: np.ndarray, scale: float = 2.0) -> np.ndarray:
+    h, w = img.shape[:2]
+    resized = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharp = cv2.filter2D(gray, -1, kernel)
+    binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+
+def get_title_crops(img: np.ndarray) -> list:
+    h, w = img.shape[:2]
+    regions = [
+        (0.18, 0.48, 0.22, 0.88),
+        (0.20, 0.42, 0.26, 0.82),
+        (0.16, 0.40, 0.20, 0.90),
+    ]
+    crops = []
+    for top_r, bottom_r, left_r, right_r in regions:
+        top = int(h * top_r)
+        bottom = int(h * bottom_r)
+        left = int(w * left_r)
+        right = int(w * right_r)
+        if bottom > top and right > left:
+            crops.append((img[top:bottom, left:right], top))
+    return crops
+
+
 def perform_ocr(image_bytes: bytes) -> str:
     """执行 OCR 识别，返回识别的原始文本"""
     nparr = np.frombuffer(image_bytes, np.uint8)
@@ -96,10 +128,11 @@ def perform_ocr(image_bytes: bytes) -> str:
 
     processed = preprocess_image(image_bytes)
     processed_bgr = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+    enlarged_original = enhance_for_ocr(original, 2.2)
 
     collected = []
 
-    def add_result(text: str, conf: float, bbox=None):
+    def add_result(text: str, conf: float, bbox=None, offset_y: float = 0.0):
         text = (text or "").strip()
         if not text:
             return
@@ -110,7 +143,7 @@ def perform_ocr(image_bytes: bytes) -> str:
             try:
                 points = bbox.tolist() if hasattr(bbox, "tolist") else bbox
                 if isinstance(points, (list, tuple)) and len(points) > 0:
-                    y_center = sum(p[1] for p in points) / len(points)
+                    y_center = sum(p[1] for p in points) / len(points) + offset_y
             except Exception:
                 pass
         collected.append({"text": text, "conf": float(conf), "y": y_center})
@@ -121,7 +154,7 @@ def perform_ocr(image_bytes: bytes) -> str:
     except RuntimeError:
         easy_reader = None
 
-    def run_easy(img: np.ndarray):
+    def run_easy(img: np.ndarray, offset_y: float = 0.0):
         if easy_reader is None:
             return
         try:
@@ -131,10 +164,14 @@ def perform_ocr(image_bytes: bytes) -> str:
         for bbox, text, conf in ocr_results:
             if conf is None or conf < 0.15:
                 continue
-            add_result(text, conf, bbox)
+            add_result(text, conf, bbox, offset_y)
 
     run_easy(original)
     run_easy(processed_bgr)
+    run_easy(enlarged_original)
+    for crop, top in get_title_crops(original):
+        run_easy(crop, top)
+        run_easy(enhance_for_ocr(crop, 3.0), top)
 
     # RapidOCR （如可用）
     rapid_reader = get_rapidocr_reader()
@@ -183,25 +220,55 @@ def extract_drug_info(raw_text: str) -> dict:
 
     text = raw_text.replace(" ", "")
     lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+    upper_text = raw_text.upper()
 
     # 药品名称提取
     name_patterns = [
         r"(?:通用名称|药品名称|品名)[：:]\s*(.+?)(?:\n|$)",
         r"(?:商品名称|商品名)[：:]\s*(.+?)(?:\n|$)",
+        r"([\u4e00-\u9fff]{2,16}(?:缓释|控释|肠溶|分散|咀嚼|复方)?(?:片|胶囊|颗粒|口服液|滴眼液|丸|糖浆|散|软膏|栓))",
     ]
     for p in name_patterns:
         m = re.search(p, text)
         if m:
-            info["drug_name"] = m.group(1).strip()
-            break
+            candidate = m.group(1).strip()
+            if not any(f in candidate for f in NAME_FORBIDDEN):
+                info["drug_name"] = candidate
+                break
 
     # 如果没匹配到，取第一行非空文本作为药名
     if not info["drug_name"] and lines:
         def clean_line(line: str) -> str:
             return re.sub(r"[：:，,。.·\-_/\\|]", "", line).strip()
 
+        chinese_candidates = []
+        for idx, line in enumerate(lines):
+            normalized = clean_line(line)
+            if not normalized or any(f in normalized for f in NAME_FORBIDDEN):
+                continue
+            if CHINESE_REGEX.search(normalized):
+                chinese_candidates.append((idx, normalized))
+
+        for idx, normalized in chinese_candidates:
+            if any(suffix in normalized for suffix in NAME_SUFFIXES) and 2 <= len(normalized) <= 20:
+                info["drug_name"] = normalized
+                break
+
+        if not info["drug_name"]:
+            for i in range(len(chinese_candidates) - 1):
+                first_idx, first = chinese_candidates[i]
+                second_idx, second = chinese_candidates[i + 1]
+                if second_idx - first_idx != 1:
+                    continue
+                combined = first + second
+                if any(suffix in combined for suffix in NAME_SUFFIXES) and 2 <= len(combined) <= 20 and not any(f in combined for f in NAME_FORBIDDEN):
+                    info["drug_name"] = combined
+                    break
+
         # 先寻找包含常见剂型后缀的中文
         for line in lines:
+            if info["drug_name"]:
+                break
             normalized = clean_line(line)
             if not normalized or any(f in normalized for f in NAME_FORBIDDEN):
                 continue
@@ -211,18 +278,22 @@ def extract_drug_info(raw_text: str) -> dict:
 
         # 再尝试英文药名
         if not info["drug_name"]:
+            if ("IBUPROFEN" in upper_text or "VUPROFEN" in upper_text) and ("CAPS" in upper_text or "CAPSULE" in upper_text):
+                if "SUSTAIN" in upper_text or "RELEASE" in upper_text:
+                    info["drug_name"] = "布洛芬缓释胶囊"
+                else:
+                    info["drug_name"] = "布洛芬胶囊"
+
+        if not info["drug_name"]:
             for line in lines:
                 upper_line = line.upper().strip()
                 if any(word in upper_line for word in ENGLISH_SUFFIXES) and len(upper_line) <= 30:
-                    info["drug_name"] = upper_line.title()
-                    break
-
-        # 最后退回原来的粗略策略
-        if not info["drug_name"]:
-            for line in lines[:5]:
-                normalized = clean_line(line)
-                if 2 <= len(normalized) <= 30 and not any(k in normalized for k in ["说明", "批准", "生产", "有效", "国药准字"]):
-                    info["drug_name"] = normalized
+                    for english_name, chinese_name in ENGLISH_GENERIC_MAP.items():
+                        if english_name in upper_line:
+                            info["drug_name"] = chinese_name
+                            break
+                    if not info["drug_name"]:
+                        info["drug_name"] = upper_line.title()
                     break
 
     # 规格

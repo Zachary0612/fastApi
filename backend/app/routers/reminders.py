@@ -175,12 +175,18 @@ def get_reminder_audio(reminder_id: int, db: Session = Depends(get_db),
     if not reminder:
         raise HTTPException(status_code=404, detail="提醒不存在")
 
-    filename = generate_reminder_audio(
-        reminder.drug.name,
-        reminder.dosage or "按说明书服用",
-        reminder.meal_relation,
-    )
-    return {"audio_file": filename, "url": f"/audio/{filename}"}
+    drug_name = reminder.drug.name if reminder.drug else "药品"
+    dosage = reminder.dosage or "按说明书服用"
+    meal_map = {"before_meal": "饭前", "after_meal": "饭后",
+                "empty_stomach": "空腹", "before_sleep": "睡前"}
+    meal_text = meal_map.get(reminder.meal_relation, "")
+    speech_text = f"吃药提醒：请{meal_text}服用{drug_name}，{dosage}。"
+
+    try:
+        filename = generate_reminder_audio(drug_name, dosage, reminder.meal_relation)
+        return {"audio_file": filename, "url": f"/audio/{filename}", "text": speech_text}
+    except Exception:
+        return {"audio_file": None, "url": None, "text": speech_text}
 
 
 # ========== 服药记录 ==========

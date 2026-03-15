@@ -74,22 +74,35 @@ export default function ReminderList() {
     }
   };
 
+  const speakWithBrowser = (text) => {
+    if ('speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'zh-CN';
+      u.rate = 0.8;
+      speechSynthesis.speak(u);
+    }
+  };
+
   const playAudio = async (id) => {
     try {
       const res = await reminderAPI.getAudio(id);
-      if (audioRef.current) {
+      if (res.data.url && audioRef.current) {
         audioRef.current.src = res.data.url;
-        audioRef.current.play();
+        audioRef.current.onerror = () => {
+          if (res.data.text) speakWithBrowser(res.data.text);
+        };
+        audioRef.current.play().catch(() => {
+          if (res.data.text) speakWithBrowser(res.data.text);
+        });
+      } else if (res.data.text) {
+        speakWithBrowser(res.data.text);
       }
     } catch {
       // 回退到浏览器TTS
       const reminder = reminders.find(r => r.id === id);
       if (reminder && 'speechSynthesis' in window) {
         const text = `吃药提醒：请在${reminder.reminder_time}服用${reminder.drug?.name || '药品'}，${reminder.dosage || '按说明书服用'}`;
-        const u = new SpeechSynthesisUtterance(text);
-        u.lang = 'zh-CN';
-        u.rate = 0.8;
-        speechSynthesis.speak(u);
+        speakWithBrowser(text);
       }
     }
   };

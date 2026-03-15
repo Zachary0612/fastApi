@@ -34,15 +34,36 @@ export default function ElderlyHome() {
     }
   };
 
+  const speakWithBrowser = (text) => {
+    if ('speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'zh-CN';
+      u.rate = 0.8;
+      speechSynthesis.speak(u);
+    }
+  };
+
   const playAudio = async (reminderId) => {
     try {
       const res = await reminderAPI.getAudio(reminderId);
-      if (audioRef.current) {
+      if (res.data.url && audioRef.current) {
         audioRef.current.src = res.data.url;
-        audioRef.current.play();
+        audioRef.current.onerror = () => {
+          if (res.data.text) speakWithBrowser(res.data.text);
+        };
+        audioRef.current.play().catch(() => {
+          if (res.data.text) speakWithBrowser(res.data.text);
+        });
+      } else if (res.data.text) {
+        speakWithBrowser(res.data.text);
       }
     } catch (err) {
       console.error('播放失败', err);
+      const item = todayStatus?.items?.find(i => i.reminder_id === reminderId);
+      if (item && 'speechSynthesis' in window) {
+        const text = `吃药提醒：请在${item.reminder_time}服用${item.drug_name || '药品'}，${item.dosage || '按说明书服用'}`;
+        speakWithBrowser(text);
+      }
     }
   };
 
