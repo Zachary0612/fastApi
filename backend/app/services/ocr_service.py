@@ -119,20 +119,32 @@ def get_title_crops(img: np.ndarray) -> list:
     return crops
 
 
+def _upscale_clean(img: np.ndarray, scale: float = 2.5) -> np.ndarray:
+    """放大图像并轻度锐化，不做二值化（保留颜色信息）"""
+    h, w = img.shape[:2]
+    resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+    # 轻度锐化
+    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
+    sharp = cv2.filter2D(resized, -1, kernel)
+    return sharp
+
+
 def perform_ocr(image_bytes: bytes) -> str:
     """执行 OCR 识别，返回识别的原始文本"""
+    import logging
+    logger = logging.getLogger(__name__)
+
     nparr = np.frombuffer(image_bytes, np.uint8)
     original = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if original is None:
         raise ValueError("无法解析上传的图片")
 
-    processed = preprocess_image(image_bytes)
-    processed_bgr = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-    enlarged_original = enhance_for_ocr(original, 2.2)
+    h, w = original.shape[:2]
+    logger.info(f"OCR 输入图像尺寸: {w}x{h}")
 
     collected = []
 
-    def add_result(text: str, conf: float, bbox=None, offset_y: float = 0.0):
+    def add_result(text: str, conf: float, bbox=None, offset_y: float = 0.0, tag: str = ""):
         text = (text or "").strip()
         if not text:
             return
@@ -147,64 +159,122 @@ def perform_ocr(image_bytes: bytes) -> str:
             except Exception:
                 pass
         collected.append({"text": text, "conf": float(conf), "y": y_center})
+        if tag:
+            logger.debug(f"  [{tag}] conf={conf:.2f} text={text}")
 
-    # EasyOCR 原图 + 预处理图
+    # EasyOCR
     try:
         easy_reader = get_easyocr_reader()
     except RuntimeError:
         easy_reader = None
 
-    def run_easy(img: np.ndarray, offset_y: float = 0.0):
+    def run_easy(img: np.ndarray, offset_y: float = 0.0, tag: str = "easy",
+                 text_threshold: float = 0.4, low_text: float = 0.3,
+                 min_conf: float = 0.08):
         if easy_reader is None:
             return
         try:
-            ocr_results = easy_reader.readtext(img, detail=1, paragraph=False)
-        except Exception:
+            ocr_results = easy_reader.readtext(
+                img, detail=1, paragraph=False,
+                text_threshold=text_threshold,
+                low_text=low_text,
+                link_threshold=0.3,
+                mag_ratio=1.0,
+                width_ths=0.7,
+            )
+        except Exception as e:
+            logger.warning(f"EasyOCR [{tag}] 异常: {e}")
             return
         for bbox, text, conf in ocr_results:
-            if conf is None or conf < 0.15:
+            if conf is None or conf < min_conf:
                 continue
-            add_result(text, conf, bbox, offset_y)
+            add_result(text, conf, bbox, offset_y, tag)
 
-    run_easy(original)
-    run_easy(processed_bgr)
-    run_easy(enlarged_original)
-    for crop, top in get_title_crops(original):
-        run_easy(crop, top)
-        run_easy(enhance_for_ocr(crop, 3.0), top)
-
-    # RapidOCR （如可用）
+    # ========== RapidOCR（主力引擎，中文识别远优于 EasyOCR）==========
     rapid_reader = get_rapidocr_reader()
-    if rapid_reader is not None:
-        try:
-            rapid_results, _ = rapid_reader(original)
-        except Exception:
-            rapid_results = None
-        if rapid_results:
-            for item in rapid_results:
-                if not isinstance(item, (list, tuple)) or len(item) < 3:
-                    continue
-                box, text, score = item[0], item[1], item[2]
-                add_result(text, score, box)
 
+    def run_rapid(img: np.ndarray, offset_y: float = 0.0, tag: str = "Rapid"):
+        if rapid_reader is None:
+            return
+        try:
+            result, _ = rapid_reader(img)
+        except Exception as e:
+            logger.warning(f"RapidOCR [{tag}] 异常: {e}")
+            return
+        if not result:
+            return
+        for item in result:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            box, text, score = item[0], item[1], item[2]
+            if score is not None and score < 0.3:
+                continue
+            add_result(text, score or 0.5, box, offset_y, tag)
+
+    # Rapid Pass 1: 原图
+    run_rapid(original, tag="Rapid原图")
+
+    # Rapid Pass 2: 放大原图（提升小字识别）
+    upscaled = _upscale_clean(original, 2.0)
+    run_rapid(upscaled, tag="Rapid放大")
+
+    # Rapid Pass 3: CLAHE 增强
+    gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+    run_rapid(enhanced_bgr, tag="Rapid增强")
+
+    # ========== EasyOCR（补充引擎，捕捉 RapidOCR 可能遗漏的结果）==========
+    # EasyOCR Pass 1: 原图
+    run_easy(original, tag="Easy原图")
+
+    # EasyOCR Pass 2: 放大
+    run_easy(upscaled, tag="Easy放大")
+
+    # EasyOCR Pass 3: CLAHE 增强
+    run_easy(enhanced_bgr, tag="Easy增强")
+
+    # EasyOCR Pass 4: 标题区域裁剪（药盒正面）
+    for crop, top in get_title_crops(original):
+        run_easy(crop, top, tag="标题裁剪")
+        run_rapid(crop, top, tag="Rapid标题")
+
+    logger.info(f"OCR 共收集 {len(collected)} 条结果")
     if not collected:
         return ""
 
     # 按 y 坐标排序，再按置信度
     collected.sort(key=lambda r: (r["y"], -r["conf"]))
 
-    seen = set()
+    # 去重：短文本被长文本包含时丢弃短的
+    seen_normalized = set()
     merged_lines = []
     for item in collected:
         normalized = re.sub(r"\s+", "", item["text"])
-        if not normalized:
+        if not normalized or len(normalized) < 1:
             continue
-        if normalized in seen:
+        if normalized in seen_normalized:
             continue
-        seen.add(normalized)
+        # 检查是否已被更长的结果包含
+        is_substr = False
+        for existing in seen_normalized:
+            if len(normalized) < len(existing) and normalized in existing:
+                is_substr = True
+                break
+        if is_substr:
+            continue
+        # 移除被当前结果包含的旧短结果
+        to_remove = [e for e in seen_normalized if len(e) < len(normalized) and e in normalized]
+        for r in to_remove:
+            seen_normalized.discard(r)
+            merged_lines = [l for l in merged_lines if re.sub(r"\s+", "", l) != r]
+        seen_normalized.add(normalized)
         merged_lines.append(item["text"])
 
-    return "\n".join(merged_lines)
+    result = "\n".join(merged_lines)
+    logger.info(f"OCR 最终结果 ({len(result)} 字): {result[:300]}")
+    return result
 
 
 def extract_drug_info(raw_text: str) -> dict:

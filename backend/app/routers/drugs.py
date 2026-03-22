@@ -14,6 +14,17 @@ from app.services.ocr_service import perform_ocr, extract_drug_info
 from app.services.semantic_service import simplify_efficacy, simplify_usage, simplify_caution
 from app.services.tts_service import generate_drug_audio
 
+import logging
+logger = logging.getLogger(__name__)
+
+def _get_ml_pipeline():
+    """尝试加载 ML Pipeline，不可用则返回 None"""
+    try:
+        from ml.inference.pipeline import get_pipeline
+        return get_pipeline()
+    except Exception:
+        return None
+
 router = APIRouter(prefix="/api/drugs", tags=["药品管理"])
 
 
@@ -48,6 +59,29 @@ async def recognize_drug(
 
     # OCR 识别（CPU 密集型，放到线程池避免阻塞事件循环）
     loop = asyncio.get_event_loop()
+
+    # 优先尝试 ML Pipeline（自训练模型）
+    pipeline = _get_ml_pipeline()
+    if pipeline:
+        try:
+            result = await loop.run_in_executor(None, pipeline.recognize, contents)
+            logger.info(f"ML Pipeline 识别完成: {result.get('drug_name')}")
+            return OCRResult(
+                raw_text=result.get("raw_text", ""),
+                drug_name=result.get("drug_name"),
+                specification=result.get("specification"),
+                efficacy=result.get("efficacy"),
+                efficacy_simple=result.get("efficacy_simple") or simplify_efficacy(result.get("efficacy")),
+                usage_dosage=result.get("usage_dosage"),
+                usage_simple=result.get("usage_simple") or simplify_usage(result.get("usage_dosage")),
+                frequency=result.get("frequency"),
+                caution=result.get("caution"),
+                caution_simple=result.get("caution_simple") or simplify_caution(result.get("caution")),
+            )
+        except Exception as e:
+            logger.warning(f"ML Pipeline 失败，回退到 EasyOCR: {e}")
+
+    # 回退: EasyOCR + 正则规则
     try:
         raw_text = await loop.run_in_executor(None, perform_ocr, contents)
     except Exception as e:

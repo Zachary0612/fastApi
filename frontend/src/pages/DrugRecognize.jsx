@@ -221,9 +221,9 @@ export default function DrugRecognize() {
                   </button>
                 )}
               </div>
-              {result.efficacy && (
+              {result.efficacy_simple ? null : result.efficacy && (
                 <p className="text-gray-600 text-sm mb-2">
-                  <span className="text-gray-400">原文：</span>{result.efficacy}
+                  {result.efficacy}
                 </p>
               )}
               {result.efficacy_simple && (
@@ -249,9 +249,9 @@ export default function DrugRecognize() {
                   </button>
                 )}
               </div>
-              {result.usage_dosage && (
+              {result.usage_simple ? null : result.usage_dosage && (
                 <p className="text-gray-600 text-sm mb-2">
-                  <span className="text-gray-400">原文：</span>{result.usage_dosage}
+                  {result.usage_dosage}
                 </p>
               )}
               {result.usage_simple && (

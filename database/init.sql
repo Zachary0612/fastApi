@@ -147,6 +147,34 @@ INSERT INTO `family_relations` (`family_user_id`, `elderly_user_id`, `relation_n
 INSERT INTO `drugs` (`user_id`, `name`, `specification`, `efficacy`, `efficacy_simple`, `usage_dosage`, `usage_simple`, `frequency`, `caution`, `caution_simple`, `created_by`) VALUES
 (1, '阿莫西林胶囊', '0.25g×24粒',
  '适用于敏感菌所致的呼吸道感染、泌尿生殖道感染、皮肤软组织感染等',
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
  '这个药的作用是：杀菌消炎，治疗嗓子发炎、尿路感染、皮肤感染等',
  '口服。成人一次0.5g，每6-8小时1次，一日剂量不超过4g',
  '用嘴吃（口服），每次吃2粒，每天吃3次（早中晚各一次）。',
